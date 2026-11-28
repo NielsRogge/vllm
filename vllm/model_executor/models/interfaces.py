@@ -1843,6 +1843,12 @@ class SupportsEagle3(SupportsEagleBase, Protocol):
         MRO of your model class.
     """
 
+    dflash_target_layer_id_offset: ClassVar[int] = 1
+    """Offset added to `dflash_config["target_layer_ids"]` when translating
+    them to `set_aux_hidden_state_layers()` indices. Standard DFlash
+    checkpoints store 0-based post-layer indices (`1`); models whose
+    checkpoints already specify direct auxiliary capture indices set `0`."""
+
     def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
         """Set which layers should output auxiliary hidden states for EAGLE-3.
 

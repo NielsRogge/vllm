@@ -589,6 +589,10 @@ class Inkling2ForConditionalGeneration(
     def get_language_model(self) -> nn.Module:
         return self
 
+    # Inkling2 draft checkpoints index auxiliary taps directly by layer/visit
+    # id rather than 0-based post-layer indices.
+    dflash_target_layer_id_offset = 0
+
     def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
         self.model.aux_hidden_state_layers = tuple(layers)
 

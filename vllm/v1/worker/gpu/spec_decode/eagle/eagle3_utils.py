@@ -25,7 +25,10 @@ def set_eagle3_aux_hidden_state_layers(
         raise RuntimeError("Expected model instance for EAGLE3 configuration")
     eagle3_model = cast(SupportsEagle3, model)
 
-    aux_layers = get_eagle3_aux_layers_from_config(spec_config)
+    dflash_layer_offset = getattr(eagle3_model, "dflash_target_layer_id_offset", 1)
+    aux_layers = get_eagle3_aux_layers_from_config(
+        spec_config, dflash_layer_offset=dflash_layer_offset
+    )
     if aux_layers:
         logger.info("Using Eagle3 auxiliary layers from config: %s", aux_layers)
     else:
@@ -74,14 +77,10 @@ def reserve_aux_intermediate_tensor_slots(model: nn.Module) -> None:
     model.make_empty_intermediate_tensors = make_empty_with_aux
 
 
-def _is_inkling2_target(spec_config: SpeculativeConfig) -> bool:
-    target = getattr(spec_config, "target_model_config", None)
-    model_type = getattr(getattr(target, "hf_config", None), "model_type", "")
-    return isinstance(model_type, str) and model_type.startswith("inkling2")
-
-
 def get_eagle3_aux_layers_from_config(
     spec_config: SpeculativeConfig,
+    *,
+    dflash_layer_offset: int = 1,
 ) -> tuple[int, ...] | None:
     if not (spec_config and spec_config.draft_model_config):
         return None
@@ -90,11 +89,10 @@ def get_eagle3_aux_layers_from_config(
     if not layer_ids:
         dflash_config = getattr(hf_config, "dflash_config", None)
         if dflash_config and isinstance(dflash_config, dict):
-            layer_ids = list(dflash_config.get("target_layer_ids") or [])
-            # Inkling2 indexes auxiliary taps by visit id directly; other DFlash
-            # checkpoints use 0-based layer ids that need a +1 offset.
-            if not _is_inkling2_target(spec_config):
-                layer_ids = [i + 1 for i in layer_ids]
+            layer_ids = [
+                i + dflash_layer_offset
+                for i in (dflash_config.get("target_layer_ids") or [])
+            ]
     if not layer_ids:
         dspark_layer_ids = getattr(hf_config, "dspark_target_layer_ids", None)
         if dspark_layer_ids:

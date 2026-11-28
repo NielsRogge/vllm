@@ -1002,29 +1002,47 @@ def test_top_k_tokens_stay_in_the_processor_vocabulary(default_vllm_config):
 
 
 @pytest.mark.parametrize(
-    ("model_type", "expected"),
+    ("offset", "expected"),
     [
-        ("inkling2", (5, 23, 41)),
-        ("inkling2_loop", (5, 23, 41)),
-        ("inkling2_model", (5, 23, 41)),
-        ("qwen3", (6, 24, 42)),
+        (None, (6, 24, 42, 49)),
+        (0, (5, 23, 41, 48)),
     ],
 )
-def test_dflash_aux_layers_preserve_inkling2_visit_ids(model_type, expected):
-    """Inkling2 indexes auxiliary taps by visit id directly, without the +1 shift."""
+def test_set_eagle3_aux_layers_respects_dflash_target_layer_id_offset(offset, expected):
+    """Models can opt out of the +1 DFlash target_layer_ids shift via SupportsEagle3."""
+    from torch import nn
+
+    from vllm.model_executor.models.interfaces import SupportsEagle3
     from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
-        get_eagle3_aux_layers_from_config,
+        set_eagle3_aux_hidden_state_layers,
     )
+
+    class _TargetModel(nn.Module, SupportsEagle3):
+        def __init__(self):
+            super().__init__()
+            self.aux_layers: tuple[int, ...] = ()
+
+        def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
+            self.aux_layers = layers
+
+    if offset is not None:
+
+        class _DirectTargetModel(_TargetModel):
+            dflash_target_layer_id_offset = offset
+
+        target = _DirectTargetModel()
+    else:
+        target = _TargetModel()
 
     spec_config = SimpleNamespace(
         draft_model_config=SimpleNamespace(
-            hf_config=SimpleNamespace(dflash_config={"target_layer_ids": [5, 23, 41]})
-        ),
-        target_model_config=SimpleNamespace(
-            hf_config=SimpleNamespace(model_type=model_type)
+            hf_config=SimpleNamespace(
+                dflash_config={"target_layer_ids": [5, 23, 41, 48]}
+            )
         ),
     )
-    assert get_eagle3_aux_layers_from_config(spec_config) == expected
+    set_eagle3_aux_hidden_state_layers(target, spec_config)
+    assert target.aux_layers == expected
 
 
 @pytest.mark.skip_global_cleanup
@@ -1092,12 +1110,13 @@ def test_dflash2_rejects_unknown_selector_softcap_mode(monkeypatch):
 
 
 @pytest.mark.skip_global_cleanup
-def test_dflash2_attach_target_shares_inkling2_embed_norm(monkeypatch):
-    """Inkling2 targets normalize embeddings via embed_norm; DFlash2 shares it."""
+def test_dflash2_attach_target_shares_embed_norm_when_embed_shared(monkeypatch):
+    """DFlash2 shares target embed_norm only when it shares target embed_tokens."""
     from torch import nn
 
     from vllm.config import set_current_vllm_config
     from vllm.model_executor.models.qwen3_dflash2 import DFlash2Qwen3ForCausalLM
+    from vllm.model_executor.models.utils import PPMissingLayer
 
     hf_config = _dflash2_hf_config(None, None, 5)
     hf_config.dflash_config["input_embedding_scale"] = 2.0
@@ -1106,39 +1125,47 @@ def test_dflash2_attach_target_shares_inkling2_embed_norm(monkeypatch):
     with set_current_vllm_config(current_config):
         draft = DFlash2Qwen3ForCausalLM(vllm_config=vllm_config)
 
-    class _ScaleNorm(nn.Module):
-        def forward(self, x: torch.Tensor) -> torch.Tensor:
-            return x * 3.0
-
-    # Non-Inkling2 target with an embed_norm must not be attached.
-    non_inkling = SimpleNamespace(
-        config=SimpleNamespace(model_type="muse_glimmer"),
-        model=SimpleNamespace(embed_norm=_ScaleNorm()),
-    )
-    draft.attach_target(non_inkling)
-    assert draft.model.target_embed_norm is None
-
-    # Inkling2 target's embed_norm is attached and applied before input_embedding_scale.
-    embed_norm = _ScaleNorm()
-    inkling_target = SimpleNamespace(
-        config=SimpleNamespace(model_type="inkling2_loop"),
-        model=SimpleNamespace(embed_norm=embed_norm),
-    )
-    draft.attach_target(inkling_target)
-    assert draft.model.target_embed_norm is embed_norm
-
     class _OnesEmbed(nn.Module):
         def forward(self, ids: torch.Tensor) -> torch.Tensor:
             return torch.ones((ids.shape[0], hf_config.hidden_size))
 
+    class _ScaleNorm(nn.Module):
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            return x * 3.0
+
+    shared_embed = _OnesEmbed()
+    separate_embed = _OnesEmbed()
+    embed_norm = _ScaleNorm()
+    monkeypatch.setattr(draft.model, "embed_tokens", shared_embed)
+
+    # Distinct embed_tokens: must not attach target's embed_norm.
+    unshared_target = SimpleNamespace(
+        model=SimpleNamespace(embed_tokens=separate_embed, embed_norm=embed_norm)
+    )
+    draft.attach_target(unshared_target)
+    assert draft.model.target_embed_norm is None
+
+    # PPMissingLayer embed_norm: must not attach.
+    missing_norm_target = SimpleNamespace(
+        model=SimpleNamespace(embed_tokens=shared_embed, embed_norm=PPMissingLayer())
+    )
+    draft.attach_target(missing_norm_target)
+    assert draft.model.target_embed_norm is None
+
+    # Shared embed_tokens + real embed_norm: attached and applied before scaling.
+    shared_target = SimpleNamespace(
+        model=SimpleNamespace(embed_tokens=shared_embed, embed_norm=embed_norm)
+    )
+    draft.attach_target(shared_target)
+    assert draft.model.target_embed_norm is embed_norm
+
     token_ids = torch.tensor([1, 2, 3])
-    monkeypatch.setattr(draft.model, "embed_tokens", _OnesEmbed())
     out = draft.model.embed_input_ids(token_ids)
     torch.testing.assert_close(out, torch.full((3, hf_config.hidden_size), 6.0))
 
 
 def test_load_dflash_model_calls_attach_target(monkeypatch):
-    """load_dflash_model notifies the loaded draft model of the target model."""
+    """load_dflash_model passes the target language model to attach_target."""
     from vllm.v1.worker.gpu.spec_decode.dflash import utils as dflash_utils
 
     attached = []
@@ -1151,7 +1178,8 @@ def test_load_dflash_model_calls_attach_target(monkeypatch):
             attached.append(target)
 
     fake_draft = _FakeDraft()
-    fake_target = SimpleNamespace(name="target")
+    fake_lm = SimpleNamespace(name="language_model", model=SimpleNamespace())
+    fake_target = SimpleNamespace(get_language_model=lambda: fake_lm)
 
     monkeypatch.setattr(dflash_utils, "replace", lambda obj, **kwargs: obj)
     monkeypatch.setattr(dflash_utils, "get_draft_load_config", lambda cfg: None)
@@ -1175,4 +1203,4 @@ def test_load_dflash_model_calls_attach_target(monkeypatch):
     )
     loaded = dflash_utils.load_dflash_model(fake_target, vllm_config)
     assert loaded is fake_draft
-    assert attached == [fake_target]
+    assert attached == [fake_lm]

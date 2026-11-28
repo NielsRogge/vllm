@@ -562,10 +562,15 @@ class DFlash2Qwen3Model(DFlashQwen3Model):
         self.target_embed_norm: nn.Module | None = None
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
-        embeds = super().embed_input_ids(input_ids)
+        embeds = self.embed_tokens(input_ids)
         if self.target_embed_norm is not None:
             embeds = self.target_embed_norm(embeds)
-        return embeds * self.input_embedding_scale
+        if self.has_separate_mask_embedding and self.mask_token_id is not None:
+            is_mask = (input_ids == self.mask_token_id).unsqueeze(-1)
+            embeds = torch.where(is_mask, self.mask_embedding.to(embeds.dtype), embeds)
+        if self.input_embedding_scale != 1.0:
+            embeds = embeds * self.input_embedding_scale
+        return embeds
 
 
 class DFlash2Qwen3ForCausalLM(DFlashQwen3ForCausalLM):
@@ -592,23 +597,25 @@ class DFlash2Qwen3ForCausalLM(DFlashQwen3ForCausalLM):
         )
 
     def attach_target(self, target_model: nn.Module) -> None:
+        """Share the target's `embed_norm` when the draft shares its embedding table."""
+        from vllm.lora.layers.base import BaseLayerWithLoRA
         from vllm.model_executor.models.utils import PPMissingLayer
 
-        language_model = (
+        target_language_model = (
             target_model.get_language_model()
             if hasattr(target_model, "get_language_model")
             else target_model
         )
-        target_inner = getattr(language_model, "model", language_model)
-        model_type = getattr(
-            getattr(language_model, "config", None), "model_type", ""
-        ) or getattr(getattr(target_model, "config", None), "model_type", "")
-        is_inkling2 = (
-            isinstance(model_type, str) and model_type.startswith("inkling2")
-        ) or type(language_model).__name__.startswith("Inkling2")
+        target_inner = getattr(target_language_model, "model", target_language_model)
+        target_embed = getattr(target_inner, "embed_tokens", None) or getattr(
+            target_inner, "embedding", None
+        )
+        if isinstance(target_embed, BaseLayerWithLoRA):
+            target_embed = target_embed.base_layer
         embed_norm = getattr(target_inner, "embed_norm", None)
         if (
-            is_inkling2
+            target_embed is not None
+            and self.model.embed_tokens is target_embed
             and isinstance(embed_norm, nn.Module)
             and not isinstance(embed_norm, PPMissingLayer)
         ):
