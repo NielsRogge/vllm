@@ -25,7 +25,10 @@ def set_eagle3_aux_hidden_state_layers(
         raise RuntimeError("Expected model instance for EAGLE3 configuration")
     eagle3_model = cast(SupportsEagle3, model)
 
-    aux_layers = get_eagle3_aux_layers_from_config(spec_config)
+    dflash_layer_offset = getattr(eagle3_model, "dflash_target_layer_id_offset", 1)
+    aux_layers = get_eagle3_aux_layers_from_config(
+        spec_config, dflash_layer_offset=dflash_layer_offset
+    )
     if aux_layers:
         logger.info("Using Eagle3 auxiliary layers from config: %s", aux_layers)
     else:
@@ -76,6 +79,8 @@ def reserve_aux_intermediate_tensor_slots(model: nn.Module) -> None:
 
 def get_eagle3_aux_layers_from_config(
     spec_config: SpeculativeConfig,
+    *,
+    dflash_layer_offset: int = 1,
 ) -> tuple[int, ...] | None:
     if not (spec_config and spec_config.draft_model_config):
         return None
@@ -84,8 +89,10 @@ def get_eagle3_aux_layers_from_config(
     if not layer_ids:
         dflash_config = getattr(hf_config, "dflash_config", None)
         if dflash_config and isinstance(dflash_config, dict):
-            # Add 1 to convert DFlash's aux layer id semantics
-            layer_ids = [i + 1 for i in (dflash_config.get("target_layer_ids") or [])]
+            layer_ids = [
+                i + dflash_layer_offset
+                for i in (dflash_config.get("target_layer_ids") or [])
+            ]
     if not layer_ids:
         dspark_layer_ids = getattr(hf_config, "dspark_target_layer_ids", None)
         if dspark_layer_ids:

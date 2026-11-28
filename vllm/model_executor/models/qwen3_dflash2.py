@@ -477,6 +477,7 @@ class CandidateSelector(nn.Module):
     ) -> None:
         super().__init__()
         self.top_k = top_k
+        self.post_softcap: float | None = None
         self.predecessor_codebook = nn.Parameter(
             torch.empty(vocab_size, rank, dtype=params_dtype), requires_grad=False
         )
@@ -501,7 +502,7 @@ class CandidateSelector(nn.Module):
         anchor_token_ids: torch.Tensor,
     ) -> torch.Tensor:
         hidden = self.hidden_projection(hidden_states)
-        return _score_edges(
+        scores = _score_edges(
             self.predecessor_codebook,
             self.successor_codebook,
             candidate_ids,
@@ -510,6 +511,10 @@ class CandidateSelector(nn.Module):
             anchor_token_ids,
             self.top_k,
         )
+        if self.post_softcap is not None:
+            cap = self.post_softcap
+            scores = torch.tanh(scores / cap) * cap
+        return scores
 
 
 class DFlash2Qwen3Model(DFlashQwen3Model):
@@ -531,6 +536,16 @@ class DFlash2Qwen3Model(DFlashQwen3Model):
         self.input_embedding_scale = float(
             draft_config.get("input_embedding_scale", 1.0)
         )
+        self.selector_softcap_mode = draft_config.get(
+            "selector_softcap_mode", "before_correction"
+        )
+        if self.selector_softcap_mode not in (
+            "before_correction",
+            "after_correction",
+        ):
+            raise ValueError(
+                f"Unsupported selector_softcap_mode: {self.selector_softcap_mode!r}"
+            )
         # Without its own tag the selector shares the draft head's compile cache.
         with set_model_tag("dflash2_candidate_selector"):
             self.candidate_selector = CandidateSelector(
@@ -541,9 +556,21 @@ class DFlash2Qwen3Model(DFlashQwen3Model):
                 params_dtype=vllm_config.model_config.dtype,
                 prefix=maybe_prefix(prefix, "candidate_selector"),
             )
+        softcap = float(draft_config.get("final_logit_softcapping") or 0.0)
+        if self.selector_softcap_mode == "after_correction" and softcap > 0:
+            self.candidate_selector.post_softcap = softcap
+        self.target_embed_norm: nn.Module | None = None
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
-        return super().embed_input_ids(input_ids) * self.input_embedding_scale
+        embeds = self.embed_tokens(input_ids)
+        if self.target_embed_norm is not None:
+            embeds = self.target_embed_norm(embeds)
+        if self.has_separate_mask_embedding and self.mask_token_id is not None:
+            is_mask = (input_ids == self.mask_token_id).unsqueeze(-1)
+            embeds = torch.where(is_mask, self.mask_embedding.to(embeds.dtype), embeds)
+        if self.input_embedding_scale != 1.0:
+            embeds = embeds * self.input_embedding_scale
+        return embeds
 
 
 class DFlash2Qwen3ForCausalLM(DFlashQwen3ForCausalLM):
@@ -556,6 +583,11 @@ class DFlash2Qwen3ForCausalLM(DFlashQwen3ForCausalLM):
         super().__init__(vllm_config=vllm_config, prefix=prefix)
         draft_config = self.config.dflash_config
         softcap = float(draft_config.get("final_logit_softcapping") or 0.0)
+        if (
+            draft_config.get("selector_softcap_mode", "before_correction")
+            == "after_correction"
+        ):
+            softcap = 0.0
         # Candidates index the selector codebooks, which have the draft's
         # vocabulary; the target's vocabulary can be larger.
         self.candidate_logits_processor = LogitsProcessor(
@@ -563,6 +595,31 @@ class DFlash2Qwen3ForCausalLM(DFlashQwen3ForCausalLM):
             scale=float(draft_config.get("output_multiplier", 1.0)),
             soft_cap=softcap if softcap > 0 else None,
         )
+
+    def attach_target(self, target_model: nn.Module) -> None:
+        """Share the target's `embed_norm` when the draft shares its embedding table."""
+        from vllm.lora.layers.base import BaseLayerWithLoRA
+        from vllm.model_executor.models.utils import PPMissingLayer
+
+        target_language_model = (
+            target_model.get_language_model()
+            if hasattr(target_model, "get_language_model")
+            else target_model
+        )
+        target_inner = getattr(target_language_model, "model", target_language_model)
+        target_embed = getattr(target_inner, "embed_tokens", None) or getattr(
+            target_inner, "embedding", None
+        )
+        if isinstance(target_embed, BaseLayerWithLoRA):
+            target_embed = target_embed.base_layer
+        embed_norm = getattr(target_inner, "embed_norm", None)
+        if (
+            target_embed is not None
+            and self.model.embed_tokens is target_embed
+            and isinstance(embed_norm, nn.Module)
+            and not isinstance(embed_norm, PPMissingLayer)
+        ):
+            self.model.target_embed_norm = embed_norm
 
     def compute_candidates(
         self, hidden_states: torch.Tensor

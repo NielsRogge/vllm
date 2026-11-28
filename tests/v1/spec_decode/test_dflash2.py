@@ -999,3 +999,208 @@ def test_top_k_tokens_stay_in_the_processor_vocabulary(default_vllm_config):
     _, ids = processor.get_top_k_tokens(head, hidden_states, 4)
     assert (ids < vocab_size).all()
     assert (processor.get_top_tokens(head, hidden_states) < vocab_size).all()
+
+
+@pytest.mark.parametrize(
+    ("offset", "expected"),
+    [
+        (None, (6, 24, 42, 49)),
+        (0, (5, 23, 41, 48)),
+    ],
+)
+def test_set_eagle3_aux_layers_respects_dflash_target_layer_id_offset(offset, expected):
+    """Models can opt out of the +1 DFlash target_layer_ids shift via SupportsEagle3."""
+    from torch import nn
+
+    from vllm.model_executor.models.interfaces import SupportsEagle3
+    from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
+        set_eagle3_aux_hidden_state_layers,
+    )
+
+    class _TargetModel(nn.Module, SupportsEagle3):
+        def __init__(self):
+            super().__init__()
+            self.aux_layers: tuple[int, ...] = ()
+
+        def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
+            self.aux_layers = layers
+
+    if offset is not None:
+
+        class _DirectTargetModel(_TargetModel):
+            dflash_target_layer_id_offset = offset
+
+        target = _DirectTargetModel()
+    else:
+        target = _TargetModel()
+
+    spec_config = SimpleNamespace(
+        draft_model_config=SimpleNamespace(
+            hf_config=SimpleNamespace(
+                dflash_config={"target_layer_ids": [5, 23, 41, 48]}
+            )
+        ),
+    )
+    set_eagle3_aux_hidden_state_layers(target, spec_config)
+    assert target.aux_layers == expected
+
+
+@pytest.mark.skip_global_cleanup
+@pytest.mark.parametrize("mode", ["before_correction", "after_correction"])
+def test_dflash2_selector_softcap_mode(monkeypatch, mode):
+    """after_correction moves softcapping from unary logits to post-edge scores."""
+    from vllm.config import set_current_vllm_config
+    from vllm.model_executor.models.qwen3_dflash2 import DFlash2Qwen3ForCausalLM
+
+    hf_config = _dflash2_hf_config(None, None, 5)
+    hf_config.dflash_config["final_logit_softcapping"] = 100.0
+    hf_config.dflash_config["selector_softcap_mode"] = mode
+    current_config, vllm_config = _mock_draft_configs(monkeypatch, hf_config)
+
+    with set_current_vllm_config(current_config):
+        model = DFlash2Qwen3ForCausalLM(vllm_config=vllm_config)
+
+    selector = model.model.candidate_selector
+    if mode == "after_correction":
+        assert model.candidate_logits_processor.soft_cap is None
+        assert selector.post_softcap == 100.0
+    else:
+        assert model.candidate_logits_processor.soft_cap == 100.0
+        assert selector.post_softcap is None
+
+    torch.manual_seed(0)
+    with torch.no_grad():
+        selector.predecessor_codebook.normal_()
+        selector.successor_codebook.normal_()
+        selector.hidden_projection.weight.normal_()
+    candidate_ids = torch.randint(0, hf_config.vocab_size, (2, 4, 3))
+    unary = torch.randn(2, 4, 3) * 50.0
+    hidden_states = torch.randn(2, 4, hf_config.hidden_size)
+    anchors = torch.randint(0, hf_config.vocab_size, (2,))
+
+    actual = selector(candidate_ids, unary, hidden_states, anchors)
+    hidden = selector.hidden_projection(hidden_states)
+    raw = _score_edges(
+        selector.predecessor_codebook,
+        selector.successor_codebook,
+        candidate_ids,
+        unary,
+        hidden,
+        anchors,
+        selector.top_k,
+    )
+    expected = torch.tanh(raw / 100.0) * 100.0 if mode == "after_correction" else raw
+    torch.testing.assert_close(actual, expected)
+
+
+@pytest.mark.skip_global_cleanup
+def test_dflash2_rejects_unknown_selector_softcap_mode(monkeypatch):
+    from vllm.config import set_current_vllm_config
+    from vllm.model_executor.models.qwen3_dflash2 import DFlash2Qwen3Model
+
+    hf_config = _dflash2_hf_config(None, None, 5)
+    hf_config.dflash_config["selector_softcap_mode"] = "invalid_mode"
+    current_config, vllm_config = _mock_draft_configs(monkeypatch, hf_config)
+    with (
+        set_current_vllm_config(current_config),
+        torch.device("meta"),
+        pytest.raises(ValueError, match="Unsupported selector_softcap_mode"),
+    ):
+        DFlash2Qwen3Model(vllm_config=vllm_config)
+
+
+@pytest.mark.skip_global_cleanup
+def test_dflash2_attach_target_shares_embed_norm_when_embed_shared(monkeypatch):
+    """DFlash2 shares target embed_norm only when it shares target embed_tokens."""
+    from torch import nn
+
+    from vllm.config import set_current_vllm_config
+    from vllm.model_executor.models.qwen3_dflash2 import DFlash2Qwen3ForCausalLM
+    from vllm.model_executor.models.utils import PPMissingLayer
+
+    hf_config = _dflash2_hf_config(None, None, 5)
+    hf_config.dflash_config["input_embedding_scale"] = 2.0
+    current_config, vllm_config = _mock_draft_configs(monkeypatch, hf_config)
+
+    with set_current_vllm_config(current_config):
+        draft = DFlash2Qwen3ForCausalLM(vllm_config=vllm_config)
+
+    class _OnesEmbed(nn.Module):
+        def forward(self, ids: torch.Tensor) -> torch.Tensor:
+            return torch.ones((ids.shape[0], hf_config.hidden_size))
+
+    class _ScaleNorm(nn.Module):
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            return x * 3.0
+
+    shared_embed = _OnesEmbed()
+    separate_embed = _OnesEmbed()
+    embed_norm = _ScaleNorm()
+    monkeypatch.setattr(draft.model, "embed_tokens", shared_embed)
+
+    # Distinct embed_tokens: must not attach target's embed_norm.
+    unshared_target = SimpleNamespace(
+        model=SimpleNamespace(embed_tokens=separate_embed, embed_norm=embed_norm)
+    )
+    draft.attach_target(unshared_target)
+    assert draft.model.target_embed_norm is None
+
+    # PPMissingLayer embed_norm: must not attach.
+    missing_norm_target = SimpleNamespace(
+        model=SimpleNamespace(embed_tokens=shared_embed, embed_norm=PPMissingLayer())
+    )
+    draft.attach_target(missing_norm_target)
+    assert draft.model.target_embed_norm is None
+
+    # Shared embed_tokens + real embed_norm: attached and applied before scaling.
+    shared_target = SimpleNamespace(
+        model=SimpleNamespace(embed_tokens=shared_embed, embed_norm=embed_norm)
+    )
+    draft.attach_target(shared_target)
+    assert draft.model.target_embed_norm is embed_norm
+
+    token_ids = torch.tensor([1, 2, 3])
+    out = draft.model.embed_input_ids(token_ids)
+    torch.testing.assert_close(out, torch.full((3, hf_config.hidden_size), 6.0))
+
+
+def test_load_dflash_model_calls_attach_target(monkeypatch):
+    """load_dflash_model passes the target language model to attach_target."""
+    from vllm.v1.worker.gpu.spec_decode.dflash import utils as dflash_utils
+
+    attached = []
+
+    class _FakeDraft:
+        config = SimpleNamespace(dflash_config={})
+        model = SimpleNamespace()
+
+        def attach_target(self, target):
+            attached.append(target)
+
+    fake_draft = _FakeDraft()
+    fake_lm = SimpleNamespace(name="language_model", model=SimpleNamespace())
+    fake_target = SimpleNamespace(get_language_model=lambda: fake_lm)
+
+    monkeypatch.setattr(dflash_utils, "replace", lambda obj, **kwargs: obj)
+    monkeypatch.setattr(dflash_utils, "get_draft_load_config", lambda cfg: None)
+    monkeypatch.setattr(dflash_utils, "get_model", lambda **kwargs: fake_draft)
+    monkeypatch.setattr(dflash_utils, "maybe_share_target_embed", lambda *a, **k: None)
+    monkeypatch.setattr(dflash_utils, "get_target_lm_head", lambda *a, **k: None)
+
+    draft_model_config = SimpleNamespace(
+        hf_config=SimpleNamespace(num_hidden_layers=1, dflash_config={})
+    )
+    speculative_config = SimpleNamespace(
+        draft_model_config=draft_model_config,
+        attention_backend=None,
+        kv_cache_dtype=None,
+        apply_draft_eplb_overrides=lambda cfg: cfg,
+    )
+    vllm_config = SimpleNamespace(
+        speculative_config=speculative_config,
+        attention_config=SimpleNamespace(),
+        cache_config=SimpleNamespace(),
+    )
+    loaded = dflash_utils.load_dflash_model(fake_target, vllm_config)
+    assert loaded is fake_draft
+    assert attached == [fake_lm]

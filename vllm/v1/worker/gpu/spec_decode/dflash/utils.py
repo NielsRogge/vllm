@@ -72,4 +72,8 @@ def load_dflash_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
             del dflash_model.lm_head
         dflash_model.lm_head = target_lm_head
 
+    attach_target = getattr(dflash_model, "attach_target", None)
+    if callable(attach_target):
+        attach_target(target_language_model)
+
     return dflash_model
